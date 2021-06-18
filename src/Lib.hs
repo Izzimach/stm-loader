@@ -1,3 +1,4 @@
+{-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE OverloadedLabels #-}
@@ -24,7 +25,7 @@ import Control.Concurrent.STM
 import Control.Concurrent.Async.Pool
 
 import qualified Data.Set as S
-import qualified Data.Map as M
+import qualified Data.Map.Strict as M
 import Data.Functor.Foldable
 import Data.Functor.Base (TreeF(..))
 
@@ -47,6 +48,7 @@ res :: SomeResource ResourceRow
 res = IsJust #a 3
 
 data ResourceInfo l r = ResourceInfo {
+    loadKey :: l,
     value :: r,
     dependsOn :: S.Set l,
     dependedBy :: S.Set l
@@ -55,78 +57,129 @@ data ResourceInfo l r = ResourceInfo {
 
 -- | update a 'ResourceInfo' so that it depends on the resource named in param 1
 addDependsOn :: (Ord l) => l -> ResourceInfo l r -> ResourceInfo l r
-addDependsOn dep (ResourceInfo r dOn dBy) = ResourceInfo r (S.insert dep dOn) dBy
+addDependsOn dep (ResourceInfo l r dOn dBy) = ResourceInfo l r (S.insert dep dOn) dBy
 
 removeDependsOn :: (Ord l) => l -> ResourceInfo l r -> ResourceInfo l r
-removeDependsOn dep (ResourceInfo r dOn dBy) = ResourceInfo r (S.delete dep dOn) dBy
+removeDependsOn dep (ResourceInfo l r dOn dBy) = ResourceInfo l r (S.delete dep dOn) dBy
 
 addDependedBy :: (Ord l) => l -> ResourceInfo l r -> ResourceInfo l r
-addDependedBy parent (ResourceInfo r dOn dBy) = ResourceInfo r dOn (S.insert parent dBy)
+addDependedBy parent (ResourceInfo l r dOn dBy) = ResourceInfo l r dOn (S.insert parent dBy)
 
 removeDependedBy :: (Ord l) => l -> ResourceInfo l r -> ResourceInfo l r
-removeDependedBy parent (ResourceInfo r dOn dBy) = ResourceInfo r dOn (S.delete parent dBy)
+removeDependedBy parent (ResourceInfo l r dOn dBy) = ResourceInfo l r dOn (S.delete parent dBy)
 
 
 
-data LoaderState l r = LoaderState
-  {
-    loadedResources :: LoadedMap l r,
-    topLevelResource :: l,
-    errorMessages :: [String]
+
+type Loaded l r = ("loaded" .== r)
+type NeedsLoad l r = ("needsLoad" .== (l,[l]) )
+type Loading l r = ("loading" .== (Async r))
+
+type EitherLoaded l r = Var ((Loaded l r) .+ (NeedsLoad l r))
+type EitherLoading l r = Var ((Loaded l r) .+ (Loading l r))
+
+data LoadedResources l r = LoadedResources {
+  -- holds all currently loaded resources, indexed by the key used to load them
+  resourceMap :: (M.Map l (ResourceInfo l r)),
+  -- | Top level resources are those manually loaded by the outside caller, and do not get automatically unloaded when
+  --   nothing depends on them.
+  topLevelResources :: S.Set l
   }
   deriving (Eq, Show)
 
 
+lookupResource :: (Ord l) => l -> LoadedResources l r -> Maybe (ResourceInfo l r)
+lookupResource k loaded = M.lookup k (resourceMap loaded)
+
+newtype LoadingMap l r = LoadingMap (M.Map l (ResourceInfo l r))
+
+
+
 -- | Add values to indicate that resource 1 depends on resource 2
-addDependency :: (Ord l) => l -> l -> LoadedMap l r -> LoadedMap l r
-addDependency parent dependency rMap =
+addDependency :: (Ord l) => l -> l -> LoadedResources l r -> LoadedResources l r
+addDependency parent dependency loaded =
+  loaded {
+    resourceMap =
       M.adjust (addDependsOn dependency) parent $
         M.adjust (addDependedBy parent) dependency $
-          rMap
+          (resourceMap loaded)
+  }
 
-removeDependency :: (Ord l) => l -> l -> LoadedMap l r -> LoadedMap l r
-removeDependency parent dependency rMap =
+-- | Removes values to show that resource 1 depends on resource 2
+removeDependency :: (Ord l) => l -> l -> LoadedResources l r -> LoadedResources l r
+removeDependency parent dependency loaded =
+  loaded {
+    resourceMap =
       M.adjust (removeDependsOn dependency) parent $
         M.adjust (removeDependedBy parent) dependency $
-          rMap
+          (resourceMap loaded)
+  }
 
 -- | Add resource to the given resource map, and update the dependency lists of the dependent resources appropriately
-addResource :: (Ord l) => l -> ResourceInfo l r -> LoadedMap l r -> LoadedMap l r
-addResource k res loaded =
-  let resDeps = (dependsOn res)
-      addResourceRecord rMap = M.insert k res rMap
-      hookupDeps rMap = foldr (addDependency k) rMap resDeps
+addResource :: (Ord l) => ResourceInfo l r -> LoadedResources l r -> LoadedResources l r
+addResource res loaded =
+  let 
+      k = loadKey res
+      depOn = dependsOn res
+      addResourceRecord rMap = rMap { resourceMap = M.insert k res (resourceMap rMap) }
+      hookupDeps rMap = foldr (addDependency k) rMap depOn
   in 
     (hookupDeps . addResourceRecord) loaded
 
+addTopLevelResource :: (Ord l) => ResourceInfo l r -> LoadedResources l r -> LoadedResources l r
+addTopLevelResource res loaded =
+  let k = loadKey res
+      loaded' = addResource res loaded
+  in
+    loaded' {
+      topLevelResources = S.insert k (topLevelResources loaded')
+    }
+
+
 -- | Remove this resource from the given resource map, and unhook links to dependent resources
-removeResource :: (Ord l) => l -> ResourceInfo l r -> LoadedMap l r -> LoadedMap l r
-removeResource k res loaded =
-    let resDeps = (dependsOn res)
-        deleteResourceRecord rMap = M.delete k rMap
+removeResource :: (Ord l) => ResourceInfo l r -> LoadedResources l r -> LoadedResources l r
+removeResource res loaded =
+    let k = loadKey res
+        resDeps = dependsOn res
+        deleteResourceRecord rMap = rMap { resourceMap = M.delete k (resourceMap rMap) }
         unhookDeps rMap = foldr (removeDependency k) rMap resDeps
     in
       (unhookDeps . deleteResourceRecord) loaded      
 
-isUnloadable :: (Ord l) => ResourceInfo l r -> UnloadingMap l r -> Bool
-isUnloadable res uMap =
-  let dBy = (dependedBy res)
-      unloadingSet = S.fromList (M.keys uMap)
+removeTopLevelResource :: (Ord l) => ResourceInfo l r -> LoadedResources l r -> LoadedResources l r
+removeTopLevelResource res loaded =
+  let k = loadKey res
+      loaded' = removeResource res loaded
   in
-    -- are all of the dependedBy resources being unloaded?
-    S.isSubsetOf dBy unloadingSet
+    loaded' {
+      topLevelResources = S.delete k (topLevelResources loaded')
+    }
+
+--
+-- unloading
+--
+
+
+isUnloadable :: (Ord l) => l -> LoadedResources l r -> UnloadingMap l r -> Bool
+isUnloadable unloadKey loaded uMap =
+  case lookupResource unloadKey loaded of
+    Nothing -> False
+    Just res -> let dBy = (dependedBy res)
+                    unloadingSet = S.fromList (M.keys uMap)
+                in
+                  -- To unload we need all of the dependedBy resources being unloaded AND
+                  -- this resource is not 'pinned' as a top level resource.
+                  S.isSubsetOf dBy unloadingSet && not (S.member unloadKey (topLevelResources loaded))
 
 -- | When we remove a resource from the resource map, there may be some resources
 --   that no longer have any "parent" resources that depend on them and can be unloaded.
 --   Given a resource that was just removed, this looks for dependent resources with zero
 --   dependedBy entries and returns a set containing keys of all these unloadable resources
-findUnloadable :: (Ord l) => ResourceInfo l r -> LoadedMap l r -> UnloadingMap l r -> S.Set l
-findUnloadable res loadedMap uMap =
-  let checkResource k = case M.lookup k loadedMap of
-                          Nothing -> Nothing 
-                          Just res -> if (isUnloadable res uMap)
-                                      then Just k
-                                      else Nothing
+findUnloadable :: (Ord l) => ResourceInfo l r -> LoadedResources l r -> UnloadingMap l r -> S.Set l
+findUnloadable res loaded uMap =
+  let checkResource k = if (isUnloadable k loaded uMap)
+                        then Just k
+                        else Nothing
   in S.fromList $ mapMaybe checkResource (S.toList $ dependsOn res)
 
 
@@ -164,15 +217,10 @@ testLoaderConfig =
     }
 
 
-type Loaded l r = ("loaded" .== r)
-type NeedsLoad l r = ("needsLoad" .== (l,[l]) )
-type Loading l r = ("loading" .== (Async r))
 
-type EitherLoaded l r = Var ((Loaded l r) .+ (NeedsLoad l r))
-type EitherLoading l r = Var ((Loaded l r) .+ (Loading l r))
-
-type LoadedMap l r = M.Map l (ResourceInfo l r)
-type LoadingMap l r = (M.Map l (ResourceInfo l r))
+--
+-- loading
+--
 
 
 waitForLoad :: EitherLoading l r -> IO r
@@ -183,13 +231,13 @@ waitForLoad (view #loading -> Just r) = do putStrLn "waiting..."; wait r
 -- | Given a resource to load (by key) generate a tree of the things that need to load.
 -- each elements of the tree is either 'Loaded' if the thing was already loaded, or 'needsload' if
 -- the resource needs to be loaded.
-loadDepsTree :: (Ord l) => LoadedMap l r -> ResourceLoaderConfig l r -> l -> IO (Tree (EitherLoaded l r))
-loadDepsTree loaded config loadKey = do
-  case (M.lookup loadKey loaded) of
+loadDepsTree :: (Ord l) => ResourceLoaderConfig l r -> LoadedResources l r -> l -> IO (Tree (EitherLoaded l r))
+loadDepsTree config loaded loadKey = do
+  case (M.lookup loadKey (resourceMap loaded)) of
     Just x -> return (Node (IsJust #loaded (value x)) [])
     Nothing -> do
       deps <- dependenciesIO config loadKey
-      depsTrees <- mapM (loadDepsTree loaded config) deps
+      depsTrees <- mapM (loadDepsTree config loaded) deps
       return (Node (IsJust #needsLoad (loadKey,deps)) depsTrees)
 
 -- | Take the tree generated by 'loadDepsTree' and start loading resources. Each resource is loaded using
@@ -200,11 +248,13 @@ loadDepsTree loaded config loadKey = do
 asyncLoad :: forall l r effs.
   (Ord l, Show l) =>
   ResourceLoaderConfig l r -> Tree (EitherLoaded l r) -> Eff '[Reader TaskGroup, (State (LoadingMap l (EitherLoading l r))),IO] (EitherLoading l r)
-asyncLoad _      (Node (view #loaded -> Just i) vs) = return (IsJust #loaded i)
-asyncLoad config (Node (view #needsLoad -> Just (lKey,deps)) vs) = do
-  loadingMap <- get @(LoadingMap l (EitherLoading l r))
-  case (M.lookup lKey loadingMap) of
+asyncLoad _      !(Node (view #loaded -> Just i) vs) = return (IsJust #loaded i)
+asyncLoad config !(Node (view #needsLoad -> Just (lKey,deps)) vs) = do
+  (LoadingMap lMap) <- get @(LoadingMap l (EitherLoading l r))
+  case (M.lookup lKey lMap) of
+    -- already loading
     Just lr -> return (value lr)
+    -- need to load
     Nothing -> do
       -- run 'asyncLoad' for all our dependencies, which will either find them already loading in the loadingMap or initiate
       -- an asynchronous load. Once this finishes every dep should have an 'EitherLoading l r'
@@ -217,16 +267,47 @@ asyncLoad config (Node (view #needsLoad -> Just (lKey,deps)) vs) = do
         (loadIO config) lKey depsR
       -- now we have an async task that is loading this resource. Add it to the loading map so that
       -- anything that depends on this resource can find it and wait for it to load.
-      let resInfo = (ResourceInfo (IsJust #loading res) (S.fromList deps) S.empty)
+      let resInfo = (ResourceInfo lKey (IsJust #loading res) (S.fromList deps) S.empty)
       modify @(LoadingMap l (EitherLoading l r)) (updateLoadingDeps lKey resInfo)
       return (IsJust #loading res)
   where
-    updateLoadingDeps lKey resInfo loadingMap =
+    updateLoadingDeps lKey resInfo (LoadingMap lMap) =
       let deps = dependsOn resInfo
+          -- modify the given resourceinfo so that it's 'dependedBy' field has the given 'parentKey'
           addDependedBy parentKey k lMap = M.adjust (\ri -> ri { dependedBy = S.insert parentKey (dependedBy ri)}) k lMap
       in
-        M.insert lKey resInfo $ foldr (addDependedBy lKey) loadingMap deps
-        
+        LoadingMap $
+          M.insert lKey resInfo $   -- add the resource
+            foldr' (addDependedBy lKey) lMap deps   -- add 'resInfo' to the 'dependedBy' field of all deps
+
+
+-- | Runs asynchronous loads to load all the resources and add them to the 'LoadedResources'. Once done,
+--   returns the new 'LoadedResources' which now includes the resources that were just loaded.
+fullLoad :: forall l r effs. (Ord l, Show l) =>
+  TaskGroup -> ResourceLoaderConfig l r -> LoadedResources l r -> [l] -> IO (LoadedResources l r)
+fullLoad tg config loaded loadList = do
+  deps <- traverse (loadDepsTree config loaded) loadList
+  withTaskGroup 4 $ \tg -> do
+    -- A monad that, when run, does the actual loading.
+    let loadAction = traverse (asyncLoad config) deps
+    -- execute the actual loading. The initial state is an empty LoadingMap
+    (LoadingMap s) <- runM $ execState (LoadingMap M.empty) $ runReader tg $ loadAction
+    -- wait for all the loads to finish. We use the state 's' since it also has keys.
+    s' <- M.traverseWithKey (\k x -> do v <- waitForLoad (value x); return $ x {value = v })  s
+    -- add the resources in s' to the LoadedResources
+    return $ M.foldr (\r x -> if elem (loadKey r) loadList
+                              then addTopLevelResource r x 
+                              else addResource r x)
+                      loaded
+                      s'
+      
+    
+
+
+
+--
+-- unloading
+--
 
 type NeedsUnload l r = ("needsUnload" .== (l,ResourceInfo l r))
 type Unloading l r = ("unloading" .== Async ())
@@ -237,12 +318,16 @@ dumpEitherUnload :: (Show l, Show r) =>  EitherUnload l r -> String
 dumpEitherUnload (view #unloading -> Just asy) = "[Async]"
 dumpEitherUnload (view #needsUnload -> Just (l,res)) = "[needsUnload " ++ show l ++ "," ++ show res ++ "]"
 
+waitForUnload :: Var (Unloading l r) -> IO ()
+waitForUnload (view #unloading -> Just a) = wait a
+
 -- | Generate a set of things to unload. Finds the resource to unload, and also
 --   finds other resources that are freed up because nothing depends on them.
 --   Returns a monad you need to run, with the state containing a map of stuff to unload.
-unloadDepsSet :: forall l r. (Ord l, Show l) => ResourceLoaderConfig l r -> LoadedMap l r -> l -> Eff '[(State (UnloadingMap l r)), IO] ()
-unloadDepsSet config loadedMap unloadKey =
-  case M.lookup unloadKey loadedMap of
+unloadDepsSet :: forall l r. (Ord l, Show l) =>
+  ResourceLoaderConfig l r -> LoadedResources l r -> l -> Eff '[State (UnloadingMap l r)] ()
+unloadDepsSet config loaded unloadKey =
+  case lookupResource unloadKey loaded of
     Nothing -> return ()
     Just res -> do
       unloadingMap <- get @(UnloadingMap l r)
@@ -253,17 +338,19 @@ unloadDepsSet config loadedMap unloadKey =
           -- add ourselves to the unloading map
           let unloadingMap' = (M.insert unloadKey (IsJust #needsUnload (unloadKey, res)) unloadingMap)
           -- look for dependencies that can be unloaded and unload them as well
-          let moreUnload = S.toList $ findUnloadable res loadedMap unloadingMap'
-          sendM $ putStrLn $ show unloadKey ++ " unload chain: " ++ show moreUnload
+          let moreUnload = S.toList $ findUnloadable res loaded unloadingMap'
+          --sendM $ putStrLn $ show unloadKey ++ " unload chain: " ++ show moreUnload
           put unloadingMap'
-          mapM_ (unloadDepsSet config loadedMap) moreUnload
+          mapM_ (unloadDepsSet config loaded) moreUnload
           return ()
 
--- | Given a map of things to unload that was generated by 'unloadDepsSet' this will initialize the unload process, attempting
+-- | Given a map of things to unload (probably generated by 'unloadDepsSet') this will initialize the unload process, attempting
 --   to multithread the unloading using 'async'. Returns a monad you need to run, passing in a 'TaskGroup' and the 'UnloadingMap'
---   Returns a tree of resources that are unloading.
-asyncUnload :: forall l r. (Ord l, Show l) =>
-  ResourceLoaderConfig l r -> l -> Eff '[Reader TaskGroup, (State (UnloadingMap l r)), IO] (Tree (Var (Unloading l r)))
+--   Returns a tree of resources that are unloading for this one resource. Each 'Async' element of the tree is waiting on the
+--   the 'Async' children so you really only need to wait on the root 'Async'.
+--   You can bind multiple monads generated by 'asyncUnload', which allows you to unload multiple resources.
+asyncUnload :: forall l r effs. (Ord l, Show l) =>
+  ResourceLoaderConfig l r -> l -> Eff '[Reader TaskGroup, (State (UnloadingMap l r)),IO] (Tree (Var (Unloading l r)))
 asyncUnload config unloadKey = do
   taskGroup <- ask
   unloadingMap <- get @(UnloadingMap l r)
@@ -272,9 +359,10 @@ asyncUnload config unloadKey = do
     Just x -> case x of
                 (view #unloading -> Just r) -> return (Node (IsJust #unloading r) [])
                 (view #needsUnload -> Just (ul,res)) -> runUnload ul res taskGroup
+    -- the unloadingmap should contain all the elements to be unloaded, so if we don't find one it's an error
     Nothing -> do
       sendM $ putStrLn $ "needsUnload not found for " ++ show unloadKey
-      error "attempt to unload resource not marked for unloading"
+      error "attempt to unload resource not marked for unloading, typically this means you tried to unload a resource that still had other resources depending on it"
   where
     runUnload ul res taskGroup = do
           -- We need the 'Async' values of unloading resources that depend on this resource
@@ -283,7 +371,7 @@ asyncUnload config unloadKey = do
           unloadTask <- sendM $ async taskGroup $ do
             -- resources that depend on this resource may refer to things in this resource,
             -- so we need to wait for all those unload first before unloading this one
-            let waitForRoot = (\(Node (view #unloading -> Just asy) _) -> wait asy)
+            let waitForRoot = (\(Node x _) -> waitForUnload x)
             mapM_ waitForRoot dependAsyncs
             (unloadIO config) ul (value res)
           -- Add this to the unloadingMap, so that dependent resources can wait for it
@@ -291,39 +379,65 @@ asyncUnload config unloadKey = do
           return (Node (IsJust #unloading unloadTask) dependAsyncs)
 
 
-loadTest :: (Ord l, l ~ String, r ~ SomeResource ResourceRow) => ResourceLoaderConfig l r -> String -> IO r
-loadTest config l = do
-  let loadedMap = M.fromList [("argh",ResourceInfo (IsJust #a 3) S.empty S.empty)]
-  deps <- loadDepsTree loadedMap config l
+-- | Runs asynchronous unloads to unload all the resources and removeadd them from the 'LoadedResources'. The new
+--   'LoadedResources' is returned immediately before all the unloads are done, since you can't access them anymore anyways.
+--   Also returns an @Async ()@ which you can wait upon if you want to wait until all the resources are unloaded
+fullUnload :: forall l r effs. (Ord l, Show l, Show r) =>
+  TaskGroup -> ResourceLoaderConfig l r -> LoadedResources l r -> [l] -> IO (LoadedResources l r, Async ())
+fullUnload tg config loaded unloadList = do
+  -- remove the unloads from the set of toplevel resources
+  let loaded' = loaded { topLevelResources = foldr' S.delete (topLevelResources loaded) unloadList }
+  -- find out resources that should be unloaded, now that their toplevel attribute is removed
+  let toUnload = filter (\k -> isUnloadable k loaded' M.empty) unloadList
+  let unloads = run $ execState M.empty $ traverse (unloadDepsSet config loaded') toUnload
+  putStrLn $ "unloads: " ++ show (M.map dumpEitherUnload unloads)
+  -- A monad that, when run, does the actual unloading.
+  let unloadAction = traverse (asyncUnload config) (M.keys unloads)
+  -- execute the actual unloading. The initial state is the LoadingMap full of 'needsload' entries
+  (as,s) <- runM $ runState unloads $ runReader tg $ unloadAction
+  -- remove unloaded resources from the LoadedResources
+  let loaded'' = foldr' (\k m -> case lookupResource k m of
+                                    Nothing -> m
+                                    Just r -> removeResource r m) loaded' (M.keys unloads)
+  -- wait for all the things to unload. Depending on thread-safety, oftentimes you don't need to wait.
+  -- You can just go do something else while resources are unloading.
+  waitAll <- async tg $ mapM_ (\(Node x _) -> waitForUnload x) as
+  return (loaded'',waitAll)
+
+-- | Runs 'fullUnload' and waits for all unloads to complete
+fullUnloadWait :: forall l r effs. (Ord l, Show l, Show r) =>
+  ResourceLoaderConfig l r -> LoadedResources l r -> [l] -> IO (LoadedResources l r)
+fullUnloadWait config loaded unloadList =
+    withTaskGroup 4 $ \tg -> do
+      (loaded',waits) <- fullUnload tg config loaded unloadList
+      wait waits
+      return loaded'
+      
+-- current recommended call: '@loadTest testLoaderConfig ["blargh"]
+loadTest :: (Ord l, l ~ String, r ~ SomeResource ResourceRow) => ResourceLoaderConfig l r -> [String] -> IO [r]
+loadTest config ls = do
+  let loaded = LoadedResources (M.fromList [("argh",ResourceInfo "argh" (IsJust #a 3) S.empty S.empty)]) S.empty
+  deps <- traverse (loadDepsTree config loaded) ls
   let loadingMap = M.empty
-  withTaskGroup 4 $ \tg -> do
-    (a,s) <- runM $ runState loadingMap $ runReader tg $ asyncLoad config deps
-    result <- waitForLoad a
-    s' <- traverse (\x -> do v <- waitForLoad (value x); return x {value = v}) s
-    putStrLn $ show s'
-    return result
+  loaded' <- withTaskGroup 4 $ \tg -> fullLoad tg config loaded ls
+  putStrLn $ show loaded'
+  return $ M.elems $ M.map value (resourceMap loaded')
 
 
-unloadTest :: (Ord l, l ~ String, r ~ SomeResource ResourceRow) => ResourceLoaderConfig l r -> String -> IO ()
-unloadTest config ul = do
-  -- instead of trying to write all the dependencies by hand I'll just make a list of ResourceInfo and
-  -- add resources from a list so that the dependencies are set up correctly
+-- current recommended call: @unloadTest testLoaderConfig ["blargh"]
+unloadTest :: (Ord l, l ~ String, r ~ SomeResource ResourceRow) => ResourceLoaderConfig l r -> [String] -> IO ()
+unloadTest config uls = do
+  -- instead of trying to write all the dependencies by hand I'll just generate the load map from a list of ResourceInfo
   -- NOTE: order is important. A resource must appear in the list after all the resources it depends upon
-  let listOfResources = [ ("argh",ResourceInfo (IsJust #a 1) S.empty S.empty)
-                        , ("ack", ResourceInfo (IsJust #a 2) (S.singleton "argh") S.empty)
-                        , ("blargh", ResourceInfo (IsJust #a 3) (S.fromList ["argh","ack"]) S.empty)
+  let listOfResources = [ (ResourceInfo "argh"(IsJust #a 1) S.empty S.empty)
+                        , (ResourceInfo "ack" (IsJust #a 2) (S.singleton "argh") S.empty)
+                        , (ResourceInfo "blargh"(IsJust #a 3) (S.fromList ["argh","ack"]) S.empty)
+                        -- add a second thing that depends on argh so it won't get unloaded when you unload only "blargh"
+                        --, (ResourceInfo "alsodeponargh" (IsJust #a 4) (S.singleton "argh") S.empty)
                         ]
-  let loadedMap = foldl (\m (l,r) -> addResource l r m) M.empty listOfResources
-  withTaskGroup 4 $ \tg -> do
-    ((),unloads) <- runM $ runState M.empty $ unloadDepsSet config loadedMap ul
-    putStrLn $ "unloads: " ++ show (M.map dumpEitherUnload unloads)
-    (au,s) <- runM $ runState unloads $ runReader tg $ traverse (asyncUnload config) (M.keys unloads)
-    traverse waitForUnload au
-    putStrLn "Unload done"
-    return ()
-  where
-    waitForUnload (Node (view #unloading -> Just a) _) = do wait a; return ()
-    waitForUnload _                                    = return ()
+  let loaded = foldl (\m r -> addResource r m) (LoadedResources M.empty (S.fromList ["blargh","ack"])) listOfResources
+  loaded' <- fullUnloadWait config loaded uls
+  putStrLn $ show loaded'
 
 
 {-

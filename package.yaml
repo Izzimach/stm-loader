@@ -46,12 +46,15 @@ executables:
     - stm-loader
 
 tests:
-  stm-loader-test:
+  basics:
     main:                Spec.hs
-    source-dirs:         test
+    source-dirs:
+    - src
+    - test
     ghc-options:
     - -threaded
     - -rtsopts
     - -with-rtsopts=-N
     dependencies:
     - stm-loader
+    - hedgehog
