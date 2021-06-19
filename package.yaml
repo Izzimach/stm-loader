@@ -58,3 +58,6 @@ tests:
     dependencies:
     - stm-loader
     - hedgehog
+    - graphviz
+    - fgl
+    - text

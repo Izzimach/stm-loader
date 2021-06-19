@@ -9,7 +9,15 @@
 {-# LANGUAGE ViewPatterns #-}
 
 module Lib
-  ( someFunc
+  ( ResourceLoaderConfig(..)
+  , LoadedResources(..)
+  , noLoadedResources
+  , asyncLoad
+  , fullLoad
+  , asyncUnload
+  , fullUnload
+  , fullUnloadWait
+  , resourceCount
   ) where
 
 import qualified GHC.Generics as GHC
@@ -87,9 +95,14 @@ data LoadedResources l r = LoadedResources {
   }
   deriving (Eq, Show)
 
+noLoadedResources :: LoadedResources l r
+noLoadedResources = LoadedResources M.empty S.empty
 
 lookupResource :: (Ord l) => l -> LoadedResources l r -> Maybe (ResourceInfo l r)
 lookupResource k loaded = M.lookup k (resourceMap loaded)
+
+resourceCount :: LoadedResources l r -> Int
+resourceCount loaded = M.size (resourceMap loaded)
 
 newtype LoadingMap l r = LoadingMap (M.Map l (ResourceInfo l r))
 
@@ -191,9 +204,9 @@ type ResourceDependencies l r = l -> IO [l]
 
 data ResourceLoaderConfig l r = ResourceLoaderConfig
   {
-    loadIO :: ResourceLoad l r,
-    unloadIO :: ResourceUnload l r,
-    dependenciesIO :: ResourceDependencies l r
+    loadIO :: l -> [r] -> IO r,
+    unloadIO :: l -> r -> IO (),
+    dependenciesIO :: l -> IO [l]
   }
 
 testLoaderConfig :: ResourceLoaderConfig String (SomeResource ResourceRow)
@@ -225,7 +238,7 @@ testLoaderConfig =
 
 waitForLoad :: EitherLoading l r -> IO r
 waitForLoad (view #loaded -> Just r) = return r
-waitForLoad (view #loading -> Just r) = do putStrLn "waiting..."; wait r
+waitForLoad (view #loading -> Just r) = wait r
 
 
 -- | Given a resource to load (by key) generate a tree of the things that need to load.
@@ -263,7 +276,7 @@ asyncLoad config !(Node (view #needsLoad -> Just (lKey,deps)) vs) = do
       -- fork off a task to wait for dependencies and then load the resource once all dependencies are loaded
       res <- sendM $ async taskGroup $ do
         depsR <- mapM waitForLoad depsLoading   -- waits for all dependencies
-        putStrLn $ "start load of " ++ show lKey
+        --putStrLn $ "start load of " ++ show lKey
         (loadIO config) lKey depsR
       -- now we have an async task that is loading this resource. Add it to the loading map so that
       -- anything that depends on this resource can find it and wait for it to load.
@@ -390,7 +403,7 @@ fullUnload tg config loaded unloadList = do
   -- find out resources that should be unloaded, now that their toplevel attribute is removed
   let toUnload = filter (\k -> isUnloadable k loaded' M.empty) unloadList
   let unloads = run $ execState M.empty $ traverse (unloadDepsSet config loaded') toUnload
-  putStrLn $ "unloads: " ++ show (M.map dumpEitherUnload unloads)
+  --putStrLn $ "unloads: " ++ show (M.map dumpEitherUnload unloads)
   -- A monad that, when run, does the actual unloading.
   let unloadAction = traverse (asyncUnload config) (M.keys unloads)
   -- execute the actual unloading. The initial state is the LoadingMap full of 'needsload' entries
@@ -433,7 +446,7 @@ unloadTest config uls = do
                         , (ResourceInfo "ack" (IsJust #a 2) (S.singleton "argh") S.empty)
                         , (ResourceInfo "blargh"(IsJust #a 3) (S.fromList ["argh","ack"]) S.empty)
                         -- add a second thing that depends on argh so it won't get unloaded when you unload only "blargh"
-                        --, (ResourceInfo "alsodeponargh" (IsJust #a 4) (S.singleton "argh") S.empty)
+                        , (ResourceInfo "alsodeponargh" (IsJust #a 4) (S.singleton "argh") S.empty)
                         ]
   let loaded = foldl (\m r -> addResource r m) (LoadedResources M.empty (S.fromList ["blargh","ack"])) listOfResources
   loaded' <- fullUnloadWait config loaded uls

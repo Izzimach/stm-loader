@@ -64,12 +64,14 @@ executable stmloader
     , zorja
   default-language: Haskell2010
 
-test-suite stm-loader-test
+test-suite basics
   type: exitcode-stdio-1.0
   main-is: Spec.hs
   other-modules:
+      Lib
       Paths_stm_loader
   hs-source-dirs:
+      src
       test
   ghc-options: -threaded -rtsopts -with-rtsopts=-N
   build-depends:
@@ -77,11 +79,15 @@ test-suite stm-loader-test
     , base >=4.7 && <5
     , containers
     , distributive
+    , fgl
     , freer-simple
     , generics-sop
+    , graphviz
+    , hedgehog
     , recursion-schemes
     , row-types
     , stm
     , stm-loader
+    , text
     , zorja
   default-language: Haskell2010
