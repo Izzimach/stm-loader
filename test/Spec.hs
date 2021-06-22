@@ -5,14 +5,12 @@
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE TemplateHaskell #-}
 
-module Spec where
+module Main where
 
-import Control.Concurrent
 import Control.Concurrent.Async.Pool
 import Control.Monad.IO.Class
 
 import Data.Foldable
-import Data.IORef
 import Data.Maybe (fromJust)
 import Data.Text.Lazy (pack)
 
@@ -24,60 +22,20 @@ import qualified Data.Map as M
 import qualified Data.Set as S
 
 import Data.GraphViz
-import Data.GraphViz.Attributes
 import qualified Data.GraphViz.Attributes.HTML as HTML
 import qualified Data.GraphViz.Attributes.Colors.X11 as X11Color
 
 import Lib
 
+import Generators
+import StateMachine
+
 main :: IO Bool
-main = checkSequential $$(discover)
+main = do
+  test1 <- checkSequential $$(discover)
+  test2 <- stateMachineTests
+  return (test1 && test2)
   
-
--- Generate a single key and resource
-data TestResource = TestResource !Int !Bool !Char
-  deriving (Eq, Show)
-
-genResource :: MonadGen m => m (String, TestResource)
-genResource = do
-  let keyLength = Range.linear 3 12
-  let intRange = Range.linearFrom 0 (-5000) 5000
-  k <- Gen.string keyLength Gen.alphaNum
-  res <- TestResource <$> (Gen.integral intRange) <*> Gen.bool <*> Gen.unicode
-  return (k,res)
-
-
--- holds a bunch of resources and the things those resources depend on
-newtype SyntheticDependencies = SyntheticDependencies { unSyntheticDependencies :: (M.Map String (TestResource, [String])) }
-  deriving (Eq, Show)
-
--- Generate a set of resources with dependencies. Dependencies can overlap but there are no
--- dependency cycles.
-genSyntheticDependencies :: MonadGen m => Range.Range Int -> m SyntheticDependencies
-genSyntheticDependencies resourceCount = do
-  resList <- Gen.list resourceCount genResource
-  resMap <- foldrM addResDeps M.empty resList
-  return $ SyntheticDependencies resMap
-  where
-    addResDeps (k,r) m = do
-      deps <- Gen.choice [
-        return [],
-        Gen.subsequence (M.keys m)
-        ]
-      return $ M.insert k (r,deps) m
-
-
-data LoaderConfigSettings = Quiet | Noisy | Slow
-
-mkLoaderConfig :: SyntheticDependencies -> LoaderConfigSettings -> Lib.ResourceLoaderConfig String TestResource
-mkLoaderConfig (SyntheticDependencies depMap) loaderSettings =
-  ResourceLoaderConfig {
-      loadIO = \l deps -> return (TestResource (3000 + length deps + length l) (null deps) 'a')
-    , unloadIO = \l r -> do return ()
-    , dependenciesIO = \l -> case M.lookup l depMap of
-                               Nothing -> return []
-                               Just (_,deps) -> return deps
-  }
 
 
 -- | If you request to load a single resource the should be at least one resource loaded as a result
@@ -116,185 +74,6 @@ runNLoads n = do
   loaded <- liftIO $ withTaskGroup 1 $ \tg -> fullLoad tg config initialLoaded loadN
   return (sDeps, loaded)
 
-
-
---
--- load/unload state machine
---
-
--- test machine state tracks which resources are loaded or unloaded
-data TestMachineState (v :: * -> *) = TestMachineState {
-  loadedV :: [Var String v],
-  synthDeps :: SyntheticDependencies,
-  initialized :: Bool,
-  stateRef :: Maybe (Var (Opaque (IORef (LoadedResources String TestResource))) v)
-  } deriving (Eq)
-
-instance (Show1 v) => Show (TestMachineState v) where
-  show (TestMachineState lV sDep init _) = "TestMachineState: loadedCount=" ++ show lV ++ " deps=" ++ show sDep ++ " initialized?: " ++ show init
-
-instance HTraversable TestMachineState where
-  htraverse f (TestMachineState lV deps init stRef) =
-    TestMachineState 
-      <$> traverse (htraverse f) lV
-      <*> pure deps 
-      <*> pure init
-      <*> traverse (htraverse f) stRef
-
-initialMachineState :: SyntheticDependencies -> TestMachineState v
-initialMachineState deps = TestMachineState [] deps False Nothing
-
-loadable :: TestMachineState Concrete -> IO [String]
-loadable (TestMachineState _ _ False _) = return []
-loadable (TestMachineState _ _ _ Nothing) = return []
-loadable (TestMachineState lV (SyntheticDependencies sd) True (Just stRef)) = do
-  let possible = S.fromList (M.keys sd)
-  let loaded = S.fromList $ fmap concrete lV
-  return $ S.toList $ (possible `S.difference` loaded)
-
-topLevelLoaded :: TestMachineState Concrete -> IO [String]
-topLevelLoaded ts = do
-  let sRef = opaque $ fromJust $ (stateRef ts)
-  lRes <- liftIO $ readIORef sRef
-  return $ S.toList (topLevelResources lRes)
-
-unloadable :: TestMachineState (v :: * -> *) -> [Var String v]
-unloadable ts = (loadedV ts)
-
-allLoadableCount :: TestMachineState v -> Int
-allLoadableCount ts = length (M.keys (unSyntheticDependencies $ synthDeps $ ts))
-
-loadedCount :: TestMachineState v -> Int
-loadedCount ts = length (loadedV ts)
-
-data InitializeLoader (v :: * -> *) = InitializeLoader (TestMachineState v) deriving (Eq, Show)
-
-instance HTraversable InitializeLoader where
-  htraverse f (InitializeLoader ts) = InitializeLoader <$> htraverse f ts
-
-data InitializeResult (v :: * -> *) = InitializeResult (IORef (LoadedResources String TestResource)) deriving (Eq)
-
-instance (Show1 v) => Show (InitializeResult v) where
-  show (InitializeResult x) = "InitializeResult [IORef]"
-
-instance HTraversable InitializeResult where
-  htraverse _ (InitializeResult x) = InitializeResult <$> pure x
-
-s_initloader :: (MonadGen gen, MonadTest m, MonadIO m) => LoadedResources String TestResource -> ResourceLoaderConfig String TestResource -> Command gen m TestMachineState
-s_initloader initState config = Command gen exec checks
-  where
-    gen ts = if (initialized ts)
-             then Nothing
-             else Just (InitializeLoader <$> Gen.constant ts)
-    exec (InitializeLoader ts) = do
-      lRes <- liftIO (newIORef initState)
-      return $ Opaque lRes
-    checks = [
-      Require (\s _ -> not $ initialized s),
-      Update (\s i lRes -> s { initialized = True, stateRef = Just $ lRes }),
-      Ensure (\s s' i o -> assert (initialized s'))
-      ]
-                         
-
-data LoadGo (v :: * -> *) = LoadGo (TestMachineState v) Int deriving (Eq,Show)
-
-instance HTraversable LoadGo where
-  htraverse f (LoadGo ts i) = LoadGo <$> htraverse f ts <*> pure i
-
-s_load :: (MonadGen gen, MonadTest m, MonadIO m) => ResourceLoaderConfig String TestResource -> Command gen m TestMachineState
-s_load config = Command
-                  (\s -> if (not $ initialized s)
-                         then Nothing
-                         else if (loadedCount s >= allLoadableCount s)  -- no more things we can load
-                              then Nothing
-                              else Just (LoadGo <$> Gen.constant s <*> Gen.int (Range.linear 0 5)))
-                  (\(LoadGo ts ix) -> do
-                      -- use ix to pick the thing to load
-                      let sRef = opaque $ fromJust $ (stateRef ts)
-                      lRes <- liftIO $ readIORef sRef
-                      loadChoices <- liftIO $ loadable ts
-                      let loadix = mod ix (length loadChoices)
-                      let l = loadChoices !! loadix
-                      lRes' <- liftIO $ withTaskGroup 1 $ \tg -> fullLoad tg config lRes [l]
-                      liftIO $ writeIORef sRef lRes'
-                      return l
-                  )
-                  [
-                    Require (\s (LoadGo _ l) -> (initialized s) && (loadedCount s < allLoadableCount s)),
-                    Update (\s i l -> s { loadedV = l : (loadedV s) }),
-                    Ensure (\s s' i o ->
-                              do
-                                assert (not $ elem o (fmap concrete (loadedV s)))
-                                assert (elem o (fmap concrete (loadedV s')))
-                                assert (loadedCount s' > loadedCount s)
-                                assert (loadedCount s' <= allLoadableCount s))
-                  ]
-
-data UnloadGo (v :: * -> *) = UnloadGo (TestMachineState v) (Var String v) deriving (Eq,Show)
-
-instance HTraversable UnloadGo where
-  htraverse f (UnloadGo ts ul) = UnloadGo <$> htraverse f ts <*> htraverse f ul
-
-s_unload :: (MonadGen gen, MonadTest m, MonadIO m) => ResourceLoaderConfig String TestResource -> Command gen m TestMachineState
-s_unload config = Command gen exec checks
-  where
-    gen s = if (not $ initialized s)
-            then Nothing
-            else case (unloadable s) of
-                  [] -> Nothing
-                  a@(x:xs) -> Just $ UnloadGo <$> Gen.constant s <*> Gen.element a
-    exec (UnloadGo ts ul) = do
-      let ulc = concrete ul
-      let sRef = opaque $ fromJust $ (stateRef ts)
-      lRes <- liftIO $ readIORef sRef
-      loadChoices <- liftIO $ loadable ts
-      lRes' <- liftIO $ withTaskGroup 1 $ \tg -> fullUnload tg config lRes [ulc]
-      liftIO $ writeIORef sRef lRes'
-      return ulc
-    checks = [
-                Require (\s (UnloadGo _ ul) -> (initialized s) && (elem ul (loadedV s))),
-                Update (\s (UnloadGo _ ul) _ -> s { loadedV = filter (/= ul) (loadedV s) }),
-                Ensure (\s s' (UnloadGo _ ul) o -> do
-                          concrete ul === o
-                          footnote $ show o ++ " " ++ show (fmap concrete (loadedV s))
-                          assert $ elem o $ fmap concrete (loadedV s)
-                          assert $ not $ elem o $ fmap concrete (loadedV s')
-                          assert (loadedCount s' < loadedCount s))
-              ]
-
-data SampleTL (v :: * -> *) = SampleTL (TestMachineState v) deriving (Eq,Show)
-
-instance HTraversable SampleTL where
-  htraverse f (SampleTL ts) = SampleTL <$> htraverse f ts
-
-
-s_sampleTLCount :: (MonadGen gen, MonadTest m, MonadIO m) => ResourceLoaderConfig String TestResource -> Command gen m TestMachineState
-s_sampleTLCount config = Command gen exec checks
-  where
-    gen s = if (not $ initialized s)
-            then Nothing
-            else Just $ SampleTL <$> Gen.constant s
-    exec (SampleTL ts) = do
-      let sRef = opaque $ fromJust $ (stateRef ts)
-      lRes <- liftIO $ readIORef sRef
-      return (length (topLevelResources lRes))
-    checks = [
-               Ensure (\s s' _ tlc -> assert $ tlc == length (loadedV s))
-             ]
-
-
-prop_StateMachineTest :: Property
-prop_StateMachineTest = property $ do
-  sDeps <- forAll $ genSyntheticDependencies (Range.linear 8 20)
-  let config = mkLoaderConfig sDeps Quiet
-  let commands = [
-        s_initloader noLoadedResources config,
-        s_load config,
-        s_unload config,
-        s_sampleTLCount config
-        ]
-  actions <- forAll $ Gen.sequential (Range.linear 5 12) (initialMachineState sDeps) commands
-  executeSequential (initialMachineState sDeps) actions
 
 --
 -- visualization using graphviz

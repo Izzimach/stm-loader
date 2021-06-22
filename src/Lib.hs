@@ -19,10 +19,9 @@ module Lib
   , fullUnloadAsync
   , resourceCount
   , ResourceInfo(..)
+  , someFunc
   ) where
 
-import qualified GHC.Generics as GHC
-import Generics.SOP
 
 import Control.Monad
 import Control.Monad.Freer
@@ -35,26 +34,19 @@ import Control.Concurrent.Async.Pool
 
 import qualified Data.Set as S
 import qualified Data.Map.Strict as M
-import Data.Functor.Foldable
-import Data.Functor.Base (TreeF(..))
 
 import Data.Foldable
-import Data.Distributive
 import Data.Tree
 import Data.Row
 import Data.Row.Variants (view)
-import Data.Maybe (mapMaybe, maybe)
-
-import Zorja.Patchable
-import Zorja.Collections.PatchableSet
-import qualified Zorja.Collections.MapValDelta as MVD
+import Data.Maybe (mapMaybe)
 
 type ResourceRow = ("a" .== Int) .+ ("b" .== String)
 type SomeResource a = Var a
 
 
-res :: SomeResource ResourceRow
-res = IsJust #a 3
+--res :: SomeResource ResourceRow
+--res = IsJust #a 3
 
 data ResourceInfo l r = ResourceInfo {
     loadKey :: l,
@@ -140,15 +132,6 @@ addResource res loaded =
   in 
     (hookupDeps . addResourceRecord) loaded
 
-addTopLevelResource :: (Ord l) => ResourceInfo l r -> LoadedResources l r -> LoadedResources l r
-addTopLevelResource res loaded =
-  let k = loadKey res
-      loaded' = addResource res loaded
-  in
-    loaded' {
-      topLevelResources = S.insert k (topLevelResources loaded')
-    }
-
 
 -- | Remove this resource from the given resource map, and unhook links to dependent resources
 removeResource :: (Ord l) => ResourceInfo l r -> LoadedResources l r -> LoadedResources l r
@@ -159,15 +142,6 @@ removeResource res loaded =
         unhookDeps rMap = foldr (removeDependency k) rMap resDeps
     in
       (unhookDeps . deleteResourceRecord) loaded      
-
-removeTopLevelResource :: (Ord l) => ResourceInfo l r -> LoadedResources l r -> LoadedResources l r
-removeTopLevelResource res loaded =
-  let k = loadKey res
-      loaded' = removeResource res loaded
-  in
-    loaded' {
-      topLevelResources = S.delete k (topLevelResources loaded')
-    }
 
 --
 -- unloading
@@ -196,12 +170,6 @@ findUnloadable res loaded uMap =
                         else Nothing
   in S.fromList $ mapMaybe checkResource (S.toList $ dependsOn res)
 
-
-
-
-type ResourceLoad l r = l -> [r] -> IO r
-type ResourceUnload l r = l -> r -> IO ()
-type ResourceDependencies l r = l -> IO [l]
 
 data ResourceLoaderConfig l r = ResourceLoaderConfig
   {
@@ -259,7 +227,7 @@ loadDepsTree config loaded loadKey = do
 --   before starting its own load. Returns a monad that you run, passing the 'TaskGroup' to use and
 --   a 'LoadingMap' with the stuff currently loaded. To chain together multiple 'asyncLoad' calls you can
 -- grab the state result from and pass that into the next call.
-asyncLoad :: forall l r effs.
+asyncLoad :: forall l r.
   (Ord l, Show l) =>
   ResourceLoaderConfig l r -> Tree (EitherLoaded l r) -> Eff '[Reader TaskGroup, (State (LoadingMap l (EitherLoading l r))),IO] (EitherLoading l r)
 asyncLoad _      !(Node (view #loaded -> Just i) vs) = return (IsJust #loaded i)
@@ -297,7 +265,7 @@ asyncLoad config !(Node (view #needsLoad -> Just (lKey,deps)) vs) = do
 
 -- | Runs asynchronous loads to load all the resources and add them to the 'LoadedResources'. Once done,
 --   returns the new 'LoadedResources' which now includes the resources that were just loaded.
-fullLoad :: forall l r effs. (Ord l, Show l) =>
+fullLoad :: forall l r. (Ord l, Show l) =>
   TaskGroup -> ResourceLoaderConfig l r -> LoadedResources l r -> [l] -> IO (LoadedResources l r)
 fullLoad tg config loaded loadList = do
   deps <- traverse (loadDepsTree config loaded) loadList
@@ -308,11 +276,10 @@ fullLoad tg config loaded loadList = do
   -- wait for all the loads to finish. We use the state 's' since it also has keys.
   s' <- M.traverseWithKey (\k x -> do v <- waitForLoad (value x); return $ x {value = v })  s
   -- add the resources in s' to the LoadedResources
-  return $ M.foldr (\r x -> if elem (loadKey r) loadList
-                            then addTopLevelResource r x 
-                            else addResource r x)
-                    loaded
-                    s'
+  let loaded' = M.foldr (\r x -> addResource r x) loaded s'
+  return $ loaded' {
+    topLevelResources = S.union (topLevelResources loaded') (S.fromList loadList)
+  } 
       
     
 
@@ -392,7 +359,7 @@ asyncUnload config unloadKey = do
           return (Node (IsJust #unloading unloadTask) dependAsyncs)
 
 -- | Starts unloading the specified resources and waits for all unloads to complete
-fullUnload :: forall l r effs. (Ord l, Show l, Show r) =>
+fullUnload :: forall l r. (Ord l, Show l, Show r) =>
   TaskGroup -> ResourceLoaderConfig l r -> LoadedResources l r -> [l] -> IO (LoadedResources l r)
 fullUnload tg config loaded unloadList  =do
     (loaded',waits) <- fullUnloadAsync tg config loaded unloadList
@@ -404,7 +371,7 @@ fullUnload tg config loaded unloadList  =do
 --   immedidately returns. The new 'LoadedResources' is returned immediately before all the unloads are done,
 --   since you can't access them anymore anyways.
 --   Also returns an @Async ()@ which you can wait upon if you want to wait until all the resources are unloaded
-fullUnloadAsync :: forall l r effs. (Ord l, Show l, Show r) =>
+fullUnloadAsync :: forall l r. (Ord l, Show l) =>
   TaskGroup -> ResourceLoaderConfig l r -> LoadedResources l r -> [l] -> IO (LoadedResources l r, Async ())
 fullUnloadAsync tg config loaded unloadList = do
   -- remove the unloads from the set of toplevel resources
@@ -427,11 +394,9 @@ fullUnloadAsync tg config loaded unloadList = do
   return (loaded'',waitAll)
 
 -- current recommended call: '@loadTest testLoaderConfig ["blargh"]
-loadTest :: (Ord l, l ~ String, r ~ SomeResource ResourceRow) => ResourceLoaderConfig l r -> [String] -> IO [r]
+loadTest :: ResourceLoaderConfig String (SomeResource ResourceRow) -> [String] -> IO [SomeResource ResourceRow]
 loadTest config ls = do
   let loaded = LoadedResources (M.fromList [("argh",ResourceInfo "argh" (IsJust #a 3) S.empty S.empty)]) S.empty
-  deps <- traverse (loadDepsTree config loaded) ls
-  let loadingMap = M.empty
   loaded' <- withTaskGroup 4 $ \tg -> fullLoad tg config loaded ls
   putStrLn $ show loaded'
   return $ M.elems $ M.map value (resourceMap loaded')
