@@ -16,8 +16,9 @@ module Lib
   , fullLoad
   , asyncUnload
   , fullUnload
-  , fullUnloadWait
+  , fullUnloadAsync
   , resourceCount
+  , ResourceInfo(..)
   ) where
 
 import qualified GHC.Generics as GHC
@@ -300,19 +301,18 @@ fullLoad :: forall l r effs. (Ord l, Show l) =>
   TaskGroup -> ResourceLoaderConfig l r -> LoadedResources l r -> [l] -> IO (LoadedResources l r)
 fullLoad tg config loaded loadList = do
   deps <- traverse (loadDepsTree config loaded) loadList
-  withTaskGroup 4 $ \tg -> do
-    -- A monad that, when run, does the actual loading.
-    let loadAction = traverse (asyncLoad config) deps
-    -- execute the actual loading. The initial state is an empty LoadingMap
-    (LoadingMap s) <- runM $ execState (LoadingMap M.empty) $ runReader tg $ loadAction
-    -- wait for all the loads to finish. We use the state 's' since it also has keys.
-    s' <- M.traverseWithKey (\k x -> do v <- waitForLoad (value x); return $ x {value = v })  s
-    -- add the resources in s' to the LoadedResources
-    return $ M.foldr (\r x -> if elem (loadKey r) loadList
-                              then addTopLevelResource r x 
-                              else addResource r x)
-                      loaded
-                      s'
+  -- A monad that, when run, does the actual loading.
+  let loadAction = traverse (asyncLoad config) deps
+  -- execute the actual loading. The initial state is an empty LoadingMap
+  (LoadingMap s) <- runM $ execState (LoadingMap M.empty) $ runReader tg $ loadAction
+  -- wait for all the loads to finish. We use the state 's' since it also has keys.
+  s' <- M.traverseWithKey (\k x -> do v <- waitForLoad (value x); return $ x {value = v })  s
+  -- add the resources in s' to the LoadedResources
+  return $ M.foldr (\r x -> if elem (loadKey r) loadList
+                            then addTopLevelResource r x 
+                            else addResource r x)
+                    loaded
+                    s'
       
     
 
@@ -391,13 +391,22 @@ asyncUnload config unloadKey = do
           modify @(UnloadingMap l r) (M.insert unloadKey (IsJust #unloading unloadTask))
           return (Node (IsJust #unloading unloadTask) dependAsyncs)
 
-
--- | Runs asynchronous unloads to unload all the resources and removeadd them from the 'LoadedResources'. The new
---   'LoadedResources' is returned immediately before all the unloads are done, since you can't access them anymore anyways.
---   Also returns an @Async ()@ which you can wait upon if you want to wait until all the resources are unloaded
+-- | Starts unloading the specified resources and waits for all unloads to complete
 fullUnload :: forall l r effs. (Ord l, Show l, Show r) =>
+  TaskGroup -> ResourceLoaderConfig l r -> LoadedResources l r -> [l] -> IO (LoadedResources l r)
+fullUnload tg config loaded unloadList  =do
+    (loaded',waits) <- fullUnloadAsync tg config loaded unloadList
+    wait waits
+    return loaded'
+      
+
+-- | Starts running asynchronous unloads to unload all the resources and remove/add them from the 'LoadedResources', then
+--   immedidately returns. The new 'LoadedResources' is returned immediately before all the unloads are done,
+--   since you can't access them anymore anyways.
+--   Also returns an @Async ()@ which you can wait upon if you want to wait until all the resources are unloaded
+fullUnloadAsync :: forall l r effs. (Ord l, Show l, Show r) =>
   TaskGroup -> ResourceLoaderConfig l r -> LoadedResources l r -> [l] -> IO (LoadedResources l r, Async ())
-fullUnload tg config loaded unloadList = do
+fullUnloadAsync tg config loaded unloadList = do
   -- remove the unloads from the set of toplevel resources
   let loaded' = loaded { topLevelResources = foldr' S.delete (topLevelResources loaded) unloadList }
   -- find out resources that should be unloaded, now that their toplevel attribute is removed
@@ -417,15 +426,6 @@ fullUnload tg config loaded unloadList = do
   waitAll <- async tg $ mapM_ (\(Node x _) -> waitForUnload x) as
   return (loaded'',waitAll)
 
--- | Runs 'fullUnload' and waits for all unloads to complete
-fullUnloadWait :: forall l r effs. (Ord l, Show l, Show r) =>
-  ResourceLoaderConfig l r -> LoadedResources l r -> [l] -> IO (LoadedResources l r)
-fullUnloadWait config loaded unloadList =
-    withTaskGroup 4 $ \tg -> do
-      (loaded',waits) <- fullUnload tg config loaded unloadList
-      wait waits
-      return loaded'
-      
 -- current recommended call: '@loadTest testLoaderConfig ["blargh"]
 loadTest :: (Ord l, l ~ String, r ~ SomeResource ResourceRow) => ResourceLoaderConfig l r -> [String] -> IO [r]
 loadTest config ls = do
@@ -449,7 +449,7 @@ unloadTest config uls = do
                         , (ResourceInfo "alsodeponargh" (IsJust #a 4) (S.singleton "argh") S.empty)
                         ]
   let loaded = foldl (\m r -> addResource r m) (LoadedResources M.empty (S.fromList ["blargh","ack"])) listOfResources
-  loaded' <- fullUnloadWait config loaded uls
+  loaded' <- withTaskGroup 4 $ \tg -> fullUnload tg config loaded uls
   putStrLn $ show loaded'
 
 

@@ -9,4 +9,4 @@ import Control.Concurrent
 import Control.Concurrent.STM
 
 main :: IO ()
-main = someFunc
+main = return ()
