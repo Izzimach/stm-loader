@@ -45,6 +45,7 @@ module LoadUnload (
   , fullUnload
   , fullUnloadAsync
   , resourceCount
+  , syncLoad
   , ResourceInfo(..)
 ) where
 
@@ -289,7 +290,40 @@ fullLoad tg config loaded loadList = do
     topLevelResources = S.union (topLevelResources loaded') (S.fromList loadList)
   }
       
-    
+-- | Loads the resources in the tree starting with children and eventually loading the root node.
+--   Returns a new 'LoadedResources' where the resource is loaded.
+syncLoadTree :: forall l r.
+  (Ord l, Show l) =>
+  ResourceLoaderConfig l r -> LoadedResources l r -> Tree (EitherLoaded l r) -> IO (LoadedResources l r)
+syncLoadTree _      loaded !(Node (IsJust (Label :: Label "loaded") i) _) = return loaded
+syncLoadTree config loaded !(Node (IsJust (Label :: Label "needsLoad") (lKey,deps)) vs) = do
+  case (M.lookup lKey (resourceMap loaded)) of
+    -- already loaded
+    Just _ -> return loaded
+    Nothing -> do
+      putStrLn $ "start load of " ++ show lKey
+      -- load all deps
+      loadedWithDeps <- foldlM (syncLoadTree config) loaded vs
+      let maybeDepValues = traverse (\l -> (M.lookup l (resourceMap loadedWithDeps))) deps
+      case (maybeDepValues) of
+        Nothing -> error "bad loading deps in syncLoad"
+        Just depValues -> do
+          r <- (loadIO config) lKey (fmap value depValues)
+          -- now we have an async task that is loading this resource. Add it to the loading map so that
+          -- anything that depends on this resource can find it and wait for it to load.
+          let resInfo = (ResourceInfo lKey r (S.fromList deps) S.empty) :: ResourceInfo l r
+          return $ addResource resInfo loadedWithDeps
+syncLoadTree _ _ (Node _ _) = error "Pattern match fail in syncLoad"
+
+syncLoad :: forall l r. (Ord l, Show l) => ResourceLoaderConfig l r -> LoadedResources l r -> [l] -> IO (LoadedResources l r)
+syncLoad config loaded loadList = do
+  -- find deps
+  deps <- traverse (loadDepsTree config loaded) loadList
+  -- recursive load of stuff
+  loadedAll <- foldlM (syncLoadTree config) loaded deps
+  return $ loadedAll {
+    topLevelResources = S.union (topLevelResources loadedAll) (S.fromList loadList)
+  }
 
 
 

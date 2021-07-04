@@ -63,6 +63,13 @@ loadTest config ls = do
   putStrLn $ show loaded'
   return $ M.elems $ M.map value (resourceMap loaded')
 
+syncLoadTest :: ResourceLoaderConfig String (SomeResource ResourceRow) -> [String] -> IO [SomeResource ResourceRow]
+syncLoadTest config ls = do
+  let loaded = LoadedResources (M.fromList [("argh",ResourceInfo "argh" (IsJust #a 3) S.empty S.empty)]) S.empty
+  loaded' <- syncLoad config loaded ls
+  putStrLn $ show loaded'
+  return $ M.elems $ M.map value (resourceMap loaded')
+
 
 -- current recommended call: @unloadTest testLoaderConfig ["blargh"]
 unloadTest :: (Ord l, l ~ String, r ~ SomeResource ResourceRow) => ResourceLoaderConfig l r -> [String] -> IO ()

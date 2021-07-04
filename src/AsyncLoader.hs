@@ -57,8 +57,9 @@ loaderGo groupSize reqT resultT config = withTaskGroup groupSize $ \tg -> loader
         if (newReq == oldReq)
            then retry
            else return newReq
-      let toLoad = newReq `S.difference` (topLevelResources loaded)
-      let toUnload = (topLevelResources loaded) `S.difference` newReq
+      let currentLoaded = (topLevelResources loaded)
+      let toLoad = newReq `S.difference` currentLoaded
+      let toUnload = currentLoaded `S.difference` newReq
       -- load stuff
       loaded' <- fullLoad tg config loaded (S.toList toLoad)
       -- unload stuff
