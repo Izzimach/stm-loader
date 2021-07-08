@@ -26,8 +26,8 @@ import Generators
 import Basics
 import StateMachine
 
-main :: IO Bool
-main = do
+mainTest :: IO Bool
+mainTest = do
   test1 <- basicsTests
   test2 <- stateMachineTests
   return (test1 && test2)

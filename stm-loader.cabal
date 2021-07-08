@@ -32,7 +32,7 @@ common deps
 
 library
   import:              deps
-  exposed-modules:     Lib, LoadUnload
+  exposed-modules:     LoadUnload, AsyncLoader
   hs-source-dirs:      src
 
 executable example
@@ -49,10 +49,13 @@ test-suite stm-test
   import:              deps
   build-depends:       hedgehog, hedgehog-corpus, graphviz
   type:                exitcode-stdio-1.0
-  main-is:             Spec.hs
+  main-is:             Main.hs
   hs-source-dirs:      test, src
   other-modules:       Lib,
                        LoadUnload,
+                       Basics,
+                       AsyncLoader,
+                       TestViz,
                        Generators,
                        StateMachine
   ghc-options:         -threaded -rtsopts

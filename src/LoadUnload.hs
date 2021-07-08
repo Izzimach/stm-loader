@@ -46,6 +46,7 @@ module LoadUnload (
   , fullUnloadAsync
   , resourceCount
   , syncLoad
+  , syncUnload
   , ResourceInfo(..)
 ) where
 
@@ -301,7 +302,7 @@ syncLoadTree config loaded !(Node (IsJust (Label :: Label "needsLoad") (lKey,dep
     -- already loaded
     Just _ -> return loaded
     Nothing -> do
-      putStrLn $ "start load of " ++ show lKey
+      --putStrLn $ "start load of " ++ show lKey
       -- load all deps
       loadedWithDeps <- foldlM (syncLoadTree config) loaded vs
       let maybeDepValues = traverse (\l -> (M.lookup l (resourceMap loadedWithDeps))) deps
@@ -400,7 +401,7 @@ asyncUnload config unloadKey = do
 
 -- | Starts unloading the specified resources and waits for all unloads to complete
 fullUnload :: forall l r. (Ord l, Show l) => TaskGroup -> ResourceLoaderConfig l r -> LoadedResources l r -> [l] -> IO (LoadedResources l r)
-fullUnload tg config loaded unloadList  =do
+fullUnload tg config loaded unloadList = do
     (loaded',waits) <- fullUnloadAsync tg config loaded unloadList
     wait waits
     return loaded'
@@ -431,3 +432,42 @@ fullUnloadAsync tg config loaded unloadList = do
   -- You can just go do something else while resources are unloading.
   waitAll <- async tg $ mapM_ (\(Node x _) -> waitForUnload x) as
   return (loaded'',waitAll)
+
+syncUnloadOne :: forall l r. (Ord l, Show l) =>
+  ResourceLoaderConfig l r -> l -> Eff '[(State (UnloadingMap l r)),IO] ()
+syncUnloadOne config unloadKey = do
+  unloadingMap <- get @(UnloadingMap l r)
+  case (M.lookup unloadKey unloadingMap) of
+    -- already unloading, just return it
+    Just x -> case x of
+                (view #unloading -> Just r) -> return () -- should not be reached...
+                (view #needsUnload -> Just (ul,res)) -> runSyncUnload ul res
+                _ -> error "pattern match error"
+    -- if it's not in here it doesn't need to be unloaded
+    Nothing -> return ()
+  where
+    runSyncUnload :: l -> ResourceInfo l r -> Eff '[(State (UnloadingMap l r)), IO] ()
+    runSyncUnload ul res = do
+          let depending = S.toList (dependedBy res)
+          unloadingMap <- get @(UnloadingMap l r)
+          as <- traverse (syncUnloadOne config) depending
+          sendM $ (unloadIO config) ul (value res)
+          -- Remove from the unloading map since it's already unloaded
+          modify @(UnloadingMap l r) (M.delete unloadKey)
+          return ()
+
+
+syncUnload :: (Show l, Ord l) => ResourceLoaderConfig l r -> LoadedResources l r -> [l] -> IO (LoadedResources l r)
+syncUnload config loaded unloadList = do
+  -- remove the unloads from the set of toplevel resources
+  let loaded' = loaded { topLevelResources = S.difference (topLevelResources loaded) (S.fromList unloadList) }
+  -- find out resources that should be unloaded, now that their toplevel attribute is removed
+  let toUnload = filter (\k -> isUnloadable k loaded' M.empty) unloadList
+  let unloads = run $ execState M.empty $ traverse (unloadDepsSet config loaded') toUnload
+  let unloadAction = traverse (syncUnloadOne config) (M.keys unloads)
+  (as,_) <- runM $ runState unloads unloadAction
+  let unloaded = foldr' (\k m -> case lookupResource k m of
+                                    Nothing -> m
+                                    Just r -> removeResource r m) loaded' (M.keys unloads)
+  return unloaded
+

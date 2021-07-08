@@ -4,7 +4,7 @@ Description : Start up/fork an asynchronous loader of resources.
 Copyright   : (c) Gary Haussmann 2021
 Stability   : experimental
 
-Runs a separate thread(s) to loade resources. Access is via STM variables:
+Runs a separate thread(s) to load resources. Access is via STM variables:
 - you put in a set of load keys in the 'stmRequest' variable
 - resources are loaded and unloaded to match the input set of requests
 - once complete, a map of the loaded resources is put in the 'stmResult' variable

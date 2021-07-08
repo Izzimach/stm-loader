@@ -73,3 +73,15 @@ prop_syncSingleLoad = property $ do
   loaded <- liftIO $ syncLoad config initialLoaded [load1]
   unloaded <- liftIO $ withTaskGroup 1 $ \tg -> fullUnload tg config loaded [load1]
   assert (resourceCount unloaded == 0)
+
+-- | If you load a single resource and then unload it there should be no resources loaded at the end
+prop_syncLoadUnload1 :: Property
+prop_syncLoadUnload1 = property $ do
+  sDeps <- forAll $ genSyntheticDependencies (Range.linear 5 10)
+  load1 <- forAll $ Gen.element (M.keys $ unSyntheticDependencies sDeps)
+  let config = mkLoaderConfig sDeps Default
+  let initialLoaded = noLoadedResources
+  loaded <- liftIO $ syncLoad config initialLoaded [load1]
+  unloaded <- liftIO $ syncUnload config loaded [load1]
+  assert (resourceCount unloaded == 0)
+

@@ -79,6 +79,13 @@ unloadTest config uls = do
     loaded' <- fullUnload tg config loaded uls
     putStrLn $ show loaded'
 
+-- current recommended call: @syncUnloadTest testLoaderConfig ["blargh"]
+syncUnloadTest :: (Ord l, l ~ String, r ~ SomeResource ResourceRow) => ResourceLoaderConfig l r -> [String] -> IO ()
+syncUnloadTest config uls = do
+  loaded <- syncLoad config (LoadedResources M.empty S.empty) ["blargh","ack"]
+  loaded' <- syncUnload config loaded uls
+  putStrLn $ show loaded'
+
 
 asyncLoaderTest ::IO ()
 asyncLoaderTest = do
