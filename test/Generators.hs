@@ -11,12 +11,15 @@ module Generators (
   SyntheticDependencies(..),
   genSyntheticDependencies,
   LoaderConfigSettings(..),
-  mkLoaderConfig
+  mkLoaderCallbacks,
+  mkAsyncLoaderConfig
   ) where
 
 import Control.Concurrent
 
 import Data.Foldable
+import Data.Set (Set)
+import qualified Data.Set as S
 import qualified Data.Map as M
 
 import Hedgehog
@@ -24,22 +27,24 @@ import Hedgehog.Corpus (animals)
 import qualified Hedgehog.Gen as Gen
 import qualified Hedgehog.Range as Range
 
-import LoadUnload
+import STMLoader.LoadUnload
+import STMLoader.AsyncLoader
 
 -- | A resource used for testing, with a few fields
 data TestResource = TestResource !Int !Bool !Char
   deriving (Eq, Show)
 
+type ErrorMessage = String
+
 -- | Generate a single 'TestResource'
-genResource :: MonadGen m => m (TestResource)
-genResource = do
+genResource :: MonadGen m => m TestResource
+genResource = 
   let intRange = Range.linearFrom 0 (-5000) 5000
-  res <- TestResource <$> (Gen.integral intRange) <*> Gen.bool <*> Gen.unicode
-  return res
+  in TestResource <$> Gen.integral intRange <*> Gen.bool <*> Gen.unicode
 
 
 -- | holds a bunch of resources and the things those resources depend on
-newtype SyntheticDependencies = SyntheticDependencies { unSyntheticDependencies :: (M.Map String (TestResource, [String])) }
+newtype SyntheticDependencies = SyntheticDependencies { unSyntheticDependencies :: M.Map String (TestResource, Set String) }
   deriving (Eq, Show)
 
 -- | Generate a set of resources with dependencies. Dependencies can overlap but there are no
@@ -56,8 +61,8 @@ genSyntheticDependencies resourceCountRange = do
     -- when we add a resource we sometimes choose some of the previously added resources as dependencies
     addResDeps (k,r) m = do
       deps <- Gen.choice [
-        return [],                  -- no dependencies
-        Gen.subsequence (M.keys m)  -- some dependencies
+        return S.empty,                  -- no dependencies
+        S.fromList <$> Gen.subsequence (M.keys m)  -- some dependencies
         ]
       return $ M.insert k (r,deps) m
 
@@ -67,23 +72,38 @@ data LoaderConfigSettings =
     Default -- the default, no delays in loading
   | Slow    -- each action (load,unload, dependencies) incurs a delay
 
-mkLoaderConfig :: SyntheticDependencies -> LoaderConfigSettings -> ResourceLoaderConfig String TestResource
-mkLoaderConfig (SyntheticDependencies depMap) loaderSettings =
+mkLoaderCallbacks :: SyntheticDependencies -> LoaderConfigSettings -> LoadUnloadCallbacks String TestResource ErrorMessage
+mkLoaderCallbacks (SyntheticDependencies synDeps) loaderSettings =
   let doDelay = case loaderSettings of
                   Default -> (\_ -> return ()) -- no-op
                   Slow    -> (\a -> threadDelay (2000+100*a))
   in
-    ResourceLoaderConfig {
-        loadIO = \l deps -> do
-          doDelay $ length deps
-          return (TestResource (3000 + length deps + length l) (null deps) 'a')
-      , unloadIO = \_ _ -> do
+    LoadUnloadCallbacks {
+        loadResource = \l depMap -> do
+          doDelay $ length depMap
+          let deps = M.keys depMap
+          return (TestResource (3000 + length deps + length l) (null deps) 'a') 
+      , unloadResource = \_ -> do
           doDelay 5
           return ()
-      , dependenciesIO = \l -> do
+      , findDependencies = \l -> do
           doDelay $ length l
-          case M.lookup l depMap of
-            Nothing -> return []
+          case M.lookup l synDeps of
+            Nothing -> return S.empty
             Just (_,deps) -> return deps
+      , processException = const $ Report "Error!"
     }
+
+mkAsyncLoaderConfig :: SyntheticDependencies -> LoaderConfigSettings -> Int -> AsyncLoaderConfig String TestResource () ErrorMessage
+mkAsyncLoaderConfig synDeps settings workers =
+  AsyncLoaderConfig
+  {
+      callbackFunctions = mkLoaderCallbacks synDeps settings
+    , workerCount = workers
+    , forkMarshal = simpleFork
+    , forkLoadWorker = simpleFork
+  }
+  where
+    simpleFork :: ThreadWrapper String TestResource () ErrorMessage
+    simpleFork = ThreadWrapper (\_ p config -> forkIO (p config))
 

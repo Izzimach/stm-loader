@@ -29,7 +29,7 @@ import Hedgehog
 import qualified Hedgehog.Gen as Gen
 import qualified Hedgehog.Range as Range
 
-import LoadUnload
+import STMLoader.LoadUnload
 import Generators
 
 stateMachineTests :: IO Bool
@@ -45,8 +45,10 @@ data TestMachineState (v :: Type -> Type) = TestMachineState {
   loadedV :: ![Var String v],
   synthDeps :: SyntheticDependencies,
   initialized :: Bool,
-  stateRef :: Maybe (Var (Opaque (IORef (LoadedResources String TestResource))) v)
+  stateRef :: Maybe (Var (Opaque (IORef (ResourcesMap String TestResource))) v)
   } deriving (Eq, Show)
+
+type ErrorMessage = String
 
 instance HTraversable TestMachineState where
   htraverse f (TestMachineState lV deps initP stRef) =
@@ -86,12 +88,14 @@ loadedCount ts = length (loadedV ts)
 
 
 
+-- initialize command
+
 data InitializeLoader (v :: Type -> Type) = InitializeLoader (TestMachineState v) deriving (Eq, Show)
 
 instance HTraversable InitializeLoader where
   htraverse f (InitializeLoader ts) = InitializeLoader <$> htraverse f ts
 
-s_initloader :: (MonadGen gen, MonadIO m) => LoadedResources String TestResource -> ResourceLoaderConfig String TestResource -> Command gen m TestMachineState
+s_initloader :: (MonadGen gen, MonadIO m) => ResourcesMap String TestResource -> LoadUnloadCallbacks String TestResource ErrorMessage-> Command gen m TestMachineState
 s_initloader initState _config = Command gen exec checks
   where
     gen ts = if (initialized ts)
@@ -114,7 +118,7 @@ data LoadGo (v :: Type -> Type) = LoadGo (TestMachineState v) Int deriving (Eq,S
 instance HTraversable LoadGo where
   htraverse f (LoadGo ts i) = LoadGo <$> htraverse f ts <*> pure i
 
-s_load :: (MonadGen gen, MonadIO m) => ResourceLoaderConfig String TestResource -> Command gen m TestMachineState
+s_load :: (MonadGen gen, MonadIO m) => LoadUnloadCallbacks String TestResource ErrorMessage -> Command gen m TestMachineState
 s_load config = Command gen exec checks
   where
     gen s = if (not $ initialized s)
@@ -129,7 +133,9 @@ s_load config = Command gen exec checks
       loadChoices <- liftIO $ loadable ts
       let loadix = mod ix (length loadChoices)
       let l = loadChoices !! loadix
-      lRes' <- liftIO $ withTaskGroup 1 $ \tg -> fullLoad tg config lRes [l]
+      let oldTopSet = topLevelResources lRes
+      let newTopSet = S.insert l oldTopSet
+      lRes' <- liftIO $ syncNewResources config lRes newTopSet
       liftIO $ writeIORef sRef lRes'
       return l
     checks = [
@@ -150,7 +156,7 @@ data UnloadGo (v :: Type -> Type) = UnloadGo (TestMachineState v) (Var String v)
 instance HTraversable UnloadGo where
   htraverse f (UnloadGo ts ul) = UnloadGo <$> htraverse f ts <*> htraverse f ul
 
-s_unload :: (MonadGen gen, MonadIO m) => ResourceLoaderConfig String TestResource -> Command gen m TestMachineState
+s_unload :: (MonadGen gen, MonadIO m) => LoadUnloadCallbacks String TestResource ErrorMessage -> Command gen m TestMachineState
 s_unload config = Command gen exec checks
   where
     gen s = if (not $ initialized s)
@@ -162,7 +168,9 @@ s_unload config = Command gen exec checks
       let ulc = concrete ul
       let sRef = opaque $ fromJust $ (stateRef ts)
       lRes <- liftIO $ readIORef sRef
-      lRes' <- liftIO $ withTaskGroup 1 $ \tg -> fullUnload tg config lRes [ulc]
+      let oldTopSet = topLevelResources lRes
+      let newTopSet = S.delete ulc oldTopSet
+      lRes' <- liftIO $ syncNewResources config lRes newTopSet
       liftIO $ writeIORef sRef lRes'
       return ulc
     checks = [
@@ -184,7 +192,7 @@ data SampleTL (v :: Type -> Type) = SampleTL (TestMachineState v) deriving (Eq,S
 instance HTraversable SampleTL where
   htraverse f (SampleTL ts) = SampleTL <$> htraverse f ts
 
-s_sampleTLCount :: (MonadGen gen, MonadIO m) => ResourceLoaderConfig String TestResource -> Command gen m TestMachineState
+s_sampleTLCount :: (MonadGen gen, MonadIO m) => LoadUnloadCallbacks String TestResource ErrorMessage -> Command gen m TestMachineState
 s_sampleTLCount _config = Command gen exec checks
   where
     gen s = if (not $ initialized s)
@@ -205,9 +213,9 @@ s_sampleTLCount _config = Command gen exec checks
 actionGen :: (MonadGen gen, MonadTest m, MonadIO m) => gen (SyntheticDependencies, Sequential m TestMachineState)
 actionGen = do
   sDeps <- genSyntheticDependencies (Range.linear 8 12)
-  let config = mkLoaderConfig sDeps Default
+  let config = mkLoaderCallbacks sDeps Default
   let commands = [
-        s_initloader noLoadedResources config,
+        s_initloader noResources config,
         s_load config,
         s_unload config,
         s_sampleTLCount config

@@ -7,20 +7,17 @@
 
 module Spec where
 
-import Control.Concurrent.Async.Pool
 import Control.Monad.IO.Class
 
-import Data.Maybe (fromJust)
-import Data.Text.Lazy (pack)
+import qualified Data.Set as S
 
-import Hedgehog
 import qualified Hedgehog.Gen as Gen
 import qualified Hedgehog.Range as Range
 
 import qualified Data.Map.Strict as M
 
 
-import LoadUnload
+import STMLoader.LoadUnload
 
 import Generators
 import Basics
@@ -33,13 +30,13 @@ mainTest = do
   return (test1 && test2)
 
 -- for REPL testing of loading
-runNLoads :: Int -> IO (SyntheticDependencies, LoadedResources String TestResource)
+runNLoads :: Int -> IO (SyntheticDependencies, ResourcesMap String TestResource)
 runNLoads n = do
   sDeps <- Gen.sample $ genSyntheticDependencies (Range.linear (n*2) (n*3))
-  loadN <- fmap (take n) $ Gen.sample $ Gen.shuffle (M.keys $ unSyntheticDependencies sDeps)
-  let config = mkLoaderConfig sDeps Default
-  let initialLoaded = noLoadedResources
-  loaded <- liftIO $ withTaskGroup 1 $ \tg -> fullLoad tg config initialLoaded loadN
+  loadN <- fmap (S.fromList . take n) $ Gen.sample $ Gen.shuffle (M.keys $ unSyntheticDependencies sDeps)
+  let config = mkLoaderCallbacks sDeps Default
+  let initialLoaded = noResources
+  loaded <- liftIO $ syncNewResources config initialLoaded loadN
   return (sDeps, loaded)
 
 

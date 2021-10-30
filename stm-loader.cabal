@@ -1,6 +1,6 @@
 cabal-version:  3.0
 name:           stm-loader
-version:        0.1.0.0
+version:        0.2.0.0
 category:       Web
 homepage:       https://example.com/
 author:         Gary Haussmann
@@ -32,13 +32,16 @@ common deps
 
 library
   import:              deps
-  exposed-modules:     LoadUnload, AsyncLoader
+  exposed-modules:     STMLoader.LoadUnload,
+                       STMLoader.AsyncLoader
   hs-source-dirs:      src
 
 executable example
   import:              deps
   main-is:             Main.hs
-  other-modules:       Lib, LoadUnload
+  other-modules:       Lib,
+                       STMLoader.LoadUnload,
+                       STMLoader.AsyncLoader
   build-depends:
   hs-source-dirs:      src, app
   ghc-options:         -threaded -rtsopts
@@ -51,10 +54,10 @@ test-suite stm-test
   type:                exitcode-stdio-1.0
   main-is:             Main.hs
   hs-source-dirs:      test, src
-  other-modules:       Lib,
-                       LoadUnload,
+  other-modules:       Spec,
+                       STMLoader.LoadUnload,
+                       STMLoader.AsyncLoader,
                        Basics,
-                       AsyncLoader,
                        TestViz,
                        Generators,
                        StateMachine

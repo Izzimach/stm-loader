@@ -7,8 +7,10 @@
 
 module TestViz where
 
-import qualified Data.Map.Strict as M
+import Data.Set (Set)
 import qualified Data.Set as S
+import Data.Map.Strict (Map)
+import qualified Data.Map.Strict as M
 import Data.Maybe (fromJust)
 import Data.Text.Lazy (pack)
 
@@ -16,7 +18,7 @@ import Data.GraphViz
 import qualified Data.GraphViz.Attributes.HTML as HTML
 import qualified Data.GraphViz.Attributes.Colors.X11 as X11Color
 
-import LoadUnload
+import STMLoader.LoadUnload
 import Generators
 
 --
@@ -48,7 +50,7 @@ dependenciesToDot sDeps@(SyntheticDependencies deps) =
       reverseLookup = M.fromList $ fmap (\(i,s) -> (s,i)) synNodes   -- map from node name to the int index of the nodes
       edgeData nodeName (_,depNodeNames) =
         let nodeIx = fromJust $ M.lookup nodeName reverseLookup
-            depIxs = fmap (\k -> fromJust $ M.lookup k reverseLookup) depNodeNames
+            depIxs = fmap (\k -> fromJust $ M.lookup k reverseLookup) (S.toList depNodeNames)
         in fmap (\x -> (nodeIx, x, "")) depIxs
       synEdges = concat $ M.elems $ M.mapWithKey edgeData deps :: [(Int,Int,String)]
 
@@ -73,9 +75,9 @@ writeGraphVizDependencies sDeps fp = do
 --
 
 
-mkResourceInfoLabel :: (Show r) => LoadedResources String r -> (Int, String) -> [Attribute]
-mkResourceInfoLabel (LoadedResources rMap topLevel) (_,name) =
-        let (ResourceInfo lKey val _ _) = fromJust $ M.lookup name rMap
+mkResourceInfoLabel :: (Show r) => ResourcesMap String r -> (Int, String) -> [Attribute]
+mkResourceInfoLabel (ResourcesMap rMap topLevel) (_,name) =
+        let (ResourceInfo lKey val _) = fromJust $ M.lookup name rMap
             loadKeyLabel = pack $ show lKey
             valueLabel = pack $ show val
             isTopLevel = S.member name topLevel
@@ -97,11 +99,11 @@ mkResourceInfoLabel (LoadedResources rMap topLevel) (_,name) =
             , color $ titleColor
             ]
 
-vizLoadedResources :: (Show r) => LoadedResources String r -> DotGraph Int
-vizLoadedResources lr@(LoadedResources rMap _topLevel) =
+vizLoadedResources :: (Show r) => ResourcesMap String r -> DotGraph Int
+vizLoadedResources lr@(ResourcesMap rMap _topLevel) =
   let resNodes = zip [1..] (M.keys rMap)
       reverseLookup = M.fromList $ fmap (\(i,s) -> (s,i)) resNodes   -- map from node name to the int index of the nodes
-      edgeData nodeName (ResourceInfo _ _ depOn _) =
+      edgeData nodeName (ResourceInfo _ _ depOn) =
         let nodeIx = fromJust $ M.lookup nodeName reverseLookup
             depIxs = fmap (\k -> fromJust $ M.lookup k reverseLookup) (S.toList depOn)
         in fmap (\x -> (nodeIx, x, "")) depIxs
