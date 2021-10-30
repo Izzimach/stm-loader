@@ -4,11 +4,11 @@ Description : Functions to asynchronously load and unload resources and their de
 Copyright   : (c) Gary Haussmann 2021
 Stability   : experimental
 
-The code in here computes resource dependencies and loads the resources via IO. Loading is
-done asynchronously using task groups so that you can control the amount of tasks to use for loading/unloading.
+The code in here computes resource dependencies has functions to sync (load and unload) resources synchronously.
+For asynchronous loading/unloading see 'STMLoader.AsyncLoader'
 
 You load a resource by specifying it's key @l@ which could be a file path or a unique identifier. After loading the resource
-will appear in @LoadedResources l r@ as a 'ResourceInfo' data structure value which you get by looking up the key @l@
+will appear in @LoadedResources l r@ as a 'ResourceInfo' data structure value which you find by looking up the key @l@
 
 You need to provide a configuration data structure 'ResourceLoaderConfig' which will:
 - compute the dependencies for any given resource key,
@@ -56,24 +56,26 @@ data ResourceInfo l r = ResourceInfo {
   }
   deriving (Eq, Show)
 
-data LoadUnloadError l r e =
-     DepsFailed l e
-  |  LoadFailed l e
-  |  UnloadFailed l r e
+data LoadUnloadError l r ex =
+     DepsFailed l ex
+  |  LoadFailed l ex
+  |  UnloadFailed l r ex
 
-data TriageError e =
+data TriageError l err =
     Drop
   | Retry
-  | Report e
+  | Report err
+  | Substitute l
 
-data LoadUnloadConfig l r e =
-  LoadUnloadConfig
+data LoadUnloadCallbacks l r err =
+  LoadUnloadCallbacks
   {
-    findDependencies :: l -> IO [l],
-    loadResource :: l -> IO (ResourceInfo l r),
+    findDependencies :: l -> IO (Set l),
+    loadResource :: l -> Map l r -> IO r,
     unloadResource :: ResourceInfo l r -> IO (),
-    -- | When a load, deps, or unload fails, 
-    processException :: forall err. (Exception err) => LoadUnloadError l r err -> TriageError e
+    -- | When a load, deps, or unload fails, this is called. Should return how to handle the error; see 'TriageError' for explanations.
+
+    processException :: forall ex. (Exception ex) => LoadUnloadError l r ex -> TriageError l err
   }
 
 
@@ -140,9 +142,9 @@ runWalkState ws = evalState ws . walkToState
       PutW w -> put w
 
 -- | Given a 'ResourcesMap' and a new top-level set, works out which resources need to be loaded and the set of resources to be kept
-walkResourceChanges :: forall l r e. (Ord l) => LoadUnloadConfig l r e -> ResourcesMap l r -> Set l -> IO (WalkState l)
-walkResourceChanges config rm newTopLevel = 
-  let findDeps = findDependencies config
+walkResourceChanges :: forall l r e. (Ord l) => LoadUnloadCallbacks l r e -> ResourcesMap l r -> Set l -> IO (WalkState l)
+walkResourceChanges callbacks rm newTopLevel = 
+  let findDeps = findDependencies callbacks
       markRoots = S.toList newTopLevel
       rMap = resourcesMap rm
   in
@@ -151,7 +153,7 @@ walkResourceChanges config rm newTopLevel =
       getW @l
 
 markForLoad :: forall l r effs. (Member (WalkMonad l) effs, LastMember IO effs, Ord l) 
-  => Map l (ResourceInfo l r) -> (l -> IO [l]) -> l -> Eff effs ()
+  => Map l (ResourceInfo l r) -> (l -> IO (Set l)) -> l -> Eff effs ()
 markForLoad loadedMap findDeps toMark = do
   --sendM $ print toMark
   (WalkState marked _) <- getW @l
@@ -167,7 +169,7 @@ markForLoad loadedMap findDeps toMark = do
     -- make sure we're loading this resource if it isn't already loaded
     let l' = if isJust (M.lookup toMark loadedMap) || isJust (M.lookup toMark l)
              then l
-             else M.insert toMark (ResourceInfo toMark () (S.fromList deps)) l
+             else M.insert toMark (ResourceInfo toMark () deps) l
     putW (WalkState m' l')
 
 
@@ -186,49 +188,66 @@ data IntermediateResourceMap l r e =
 
 -- | Switch the given ResourcesMap to a new set of resources for topLevelResources, performing
 --   the needed loads and unloads. Synchronous, so once this returns all the loads/unloads will have completed.
-syncNewResources :: (Ord l) => LoadUnloadConfig l r e -> ResourcesMap l r -> Set l -> IO (ResourcesMap l r)
-syncNewResources config rm newTop = do
-  intermediateResult <- findLoadsUnloads config rm newTop 
-                        >>= runLoads config 
-                        >>= runUnloads config
+syncNewResources :: (Ord l) => LoadUnloadCallbacks l r e -> ResourcesMap l r -> Set l -> IO (ResourcesMap l r)
+syncNewResources callbacks rm newTop = do
+  intermediateResult <- findLoadsUnloads callbacks rm newTop 
+                        >>= runLoads callbacks 
+                        >>= runUnloads callbacks
   return $ ResourcesMap (currentlyLoaded intermediateResult) newTop
 
 
-findLoadsUnloads :: (Ord l) => LoadUnloadConfig l r e-> ResourcesMap l r -> Set l -> IO (IntermediateResourceMap l r e)
-findLoadsUnloads config rm@(ResourcesMap res _) newTop = do
-  (WalkState marked toLoad) <- walkResourceChanges config rm newTop
+findLoadsUnloads :: (Ord l) => LoadUnloadCallbacks l r e-> ResourcesMap l r -> Set l -> IO (IntermediateResourceMap l r e)
+findLoadsUnloads callbacks rm@(ResourcesMap res _) newTop = do
+  (WalkState marked toLoad) <- walkResourceChanges callbacks rm newTop
   let toUnload = S.difference (S.fromList $ M.keys res) marked
   let shouldUnload = \ri -> S.member (loadKey ri) toUnload
   return $ IntermediateResourceMap res toLoad (M.filter shouldUnload res) M.empty
 
-runLoads :: (Ord l) => LoadUnloadConfig l r e-> IntermediateResourceMap l r e -> IO (IntermediateResourceMap l r e)
-runLoads config im@(IntermediateResourceMap rm loadz unloadz errorz) =
+-- | Given a set of deps, finds in the set of loaded resources and collects into a map.
+--   if any are not found returns 'Nothing'
+pullDeps :: (Ord l) => Map l (ResourceInfo l r) -> Set l -> Maybe (Map l r)
+pullDeps rm deps = setToMapMaybe deps (pullResource rm) 
+  where
+    setToMapMaybe :: (Ord l) => Set l -> (l -> Maybe (l,r)) -> Maybe (Map l r)
+    setToMapMaybe ls f = M.fromList <$> traverse f (S.toList ls)
+
+    pullResource :: (Ord l) => Map l (ResourceInfo l r) -> l -> Maybe (l,r)
+    pullResource m l = fmap (\res -> (l, value res)) (M.lookup l m)
+
+runLoads :: (Ord l) => LoadUnloadCallbacks l r e-> IntermediateResourceMap l r e -> IO (IntermediateResourceMap l r e)
+runLoads callbacks im@(IntermediateResourceMap rm loadz unloadz errorz) =
   case nextLoad loadz rm of
     Nothing -> return im
-    Just k  -> do
-      loadResult <- loadResource config k
-      let loadz' = M.delete k loadz
-      let rm' = M.insert (loadKey loadResult) loadResult rm
-      runLoads config (IntermediateResourceMap rm' loadz' unloadz errorz)
+    Just (ResourceInfo k _ deps)  -> do
+      case pullDeps rm deps of
+        Nothing -> undefined -- error, couldn't find resources
+        Just depRefs -> do
+          loadResult <- loadResource callbacks k depRefs
+          let loadz' = M.delete k loadz
+          let rm' = M.insert k (ResourceInfo k loadResult deps) rm
+          runLoads callbacks (IntermediateResourceMap rm' loadz' unloadz errorz)
 
-runUnloads :: (Ord l) => LoadUnloadConfig l r e -> IntermediateResourceMap l r e -> IO (IntermediateResourceMap l r e)
-runUnloads config im@(IntermediateResourceMap rm loadz unloadz errorz) = do
+runUnloads :: (Ord l) => LoadUnloadCallbacks l r e -> IntermediateResourceMap l r e -> IO (IntermediateResourceMap l r e)
+runUnloads callbacks im@(IntermediateResourceMap rm loadz unloadz errorz) = do
   case nextUnload unloadz rm of
     Nothing -> return im
     Just u -> do
-      unloadResource config u
+      unloadResource callbacks u
       let unloadz' = M.delete (loadKey u) unloadz
       let rm' = M.delete (loadKey u) rm
-      runUnloads config (IntermediateResourceMap rm' loadz unloadz' errorz)
+      runUnloads callbacks (IntermediateResourceMap rm' loadz unloadz' errorz)
 
 
-nextLoad :: (Ord l) => Map l (ResourceInfo l ()) -> Map l (ResourceInfo l r) -> Maybe l
+nextLoad :: (Ord l) => Map l (ResourceInfo l ()) -> Map l (ResourceInfo l r) -> Maybe (ResourceInfo l ())
 nextLoad toLoad loaded = 
   let -- we can load a resource if all it's dependencies are loaded (in the 'loaded' map)
-      canLoad (ResourceInfo _ _ deps) = all (\k -> M.member k loaded) deps
+      isLoaded k = M.member k loaded
+      canLoad (ResourceInfo _ _ deps) = all isLoaded deps
   in
-    loadKey <$> find canLoad toLoad
+    find canLoad toLoad
                                     
+-- | Find something to unload. First parameter is the map of things to unload,
+--   second is the map of things currently loaded
 nextUnload :: (Ord l) => Map l (ResourceInfo l r) -> Map l (ResourceInfo l r) -> Maybe (ResourceInfo l r)
 nextUnload toUnload loaded =
   let doesNotDependOn k (ResourceInfo _ _ deps) = not $ S.member k deps
